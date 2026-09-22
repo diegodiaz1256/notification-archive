@@ -13,18 +13,24 @@
 //! displaying every notification exactly as before. If this process is not
 //! running, nothing changes except that avatars are not saved.
 //!
-//! Files land in the same directory the shell uses for its own image copies,
-//! named `<app>-<summary hash>.png`. The shell names its files after a
-//! notification id this process never sees (the monitor observes the call,
-//! the id is assigned in the reply), so the archive matches on what both
-//! sides do have: the sending app and its summary.
+//! Files land in their own `avatars/` directory, NOT in the `images/` one the
+//! shell uses for its own copies: the shell sweeps that directory at startup
+//! and deletes anything without a matching notification JSON, which every file
+//! written here would be.
+//!
+//! They are named `<app>-<summary hash>.png`. The shell names its own copies
+//! after a notification id this process never sees (the monitor observes the
+//! method call, the id is assigned in the reply), so this matches on what both
+//! sides do have: the sending app and its summary. Two messages from the same
+//! contact collide on that name, which is correct -- it is the same photo, and
+//! the newer write keeps it current.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use dbus::blocking::Connection;
 use dbus::channel::MatchingReceiver;
@@ -38,10 +44,15 @@ use flate2::Compression;
 /// malformed message, and allocating for it helps no one.
 const MAX_DIMENSION: i32 = 512;
 
-/// Keep the directory bounded without needing a second cleanup path. The
-/// shell prunes its own history aggressively, and an orphan here is one
-/// small PNG.
-const MAX_FILES: usize = 200;
+/// A hard ceiling on the directory, in case a machine sees an implausible
+/// number of distinct senders inside the retention window.
+const MAX_FILES: usize = 500;
+
+/// Matches the archive's own thirty-day window: an avatar outlives the
+/// notification it arrived with, because the same contact's next message
+/// reuses it, but there is no reason to keep one for a contact who has not
+/// been in touch for longer than the entries it would illustrate.
+const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 fn main() {
     let dir = match avatar_dir() {
@@ -117,7 +128,7 @@ fn avatar_dir() -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(state.join("omarchy/notifications/images"))
+    Some(state.join("omarchy/notifications/avatars"))
 }
 
 fn handle(msg: &Message, dir: &PathBuf) -> Result<(), String> {
@@ -178,6 +189,14 @@ fn handle(msg: &Message, dir: &PathBuf) -> Result<(), String> {
 
     let path = dir.join(format!("{}.png", stem(&app, &summary)));
     let png = encode_png(&pixels)?;
+
+    // Created per write, not once at startup: the directory lives under
+    // ~/.local/state and can be cleared by the user, a cleanup script, or a
+    // fresh profile at any point in this process's lifetime, and a daemon
+    // that only checked once would then fail silently forever.
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
+    }
 
     // Write through a temporary file: the shell may read this directory at
     // any moment, and a half-written PNG renders as a broken image.
@@ -337,25 +356,47 @@ fn stem(app: &str, summary: &str) -> String {
     format!("avatar-{}-{:016x}", safe, hasher.finish())
 }
 
-/// Drop the oldest files once the directory grows past MAX_FILES. Only files
-/// this daemon wrote are considered: the shell owns everything else in here
-/// and prunes it on its own schedule.
+/// Expire avatars that have outlived their usefulness.
+///
+/// Two rules, both needed. Age is the real one: an avatar is worth keeping
+/// while the contact is still in touch, and MAX_AGE matches the window the
+/// archive keeps entries for, so a photo cannot outlive every notification it
+/// would illustrate. The count cap is a backstop for a machine that somehow
+/// sees more distinct senders than that inside the window.
+///
+/// A file is touched on every write, so "last modified" is "last seen from
+/// this sender", which is exactly the age that matters.
 fn trim(dir: &PathBuf) {
-    let mut ours: Vec<_> = match fs::read_dir(dir) {
+    let now = SystemTime::now();
+    let mut ours: Vec<(SystemTime, PathBuf)> = match fs::read_dir(dir) {
         Ok(entries) => entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
                     .to_str()
-                    .is_some_and(|n| n.starts_with("avatar-") && n.ends_with(".png"))
+                    .is_some_and(|name| name.starts_with("avatar-") && name.ends_with(".png"))
             })
-            .filter_map(|e| {
-                let modified = e.metadata().ok()?.modified().ok()?;
-                Some((modified, e.path()))
+            .filter_map(|entry| {
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some((modified, entry.path()))
             })
             .collect(),
         Err(_) => return,
     };
+
+    // Age first, so the count cap only ever has to consider live files.
+    ours.retain(|(modified, path)| {
+        let stale = now
+            .duration_since(*modified)
+            .map(|age| age > MAX_AGE)
+            .unwrap_or(false);
+        if stale {
+            let _ = fs::remove_file(path);
+        }
+        !stale
+    });
+
     if ours.len() <= MAX_FILES {
         return;
     }
@@ -364,3 +405,4 @@ fn trim(dir: &PathBuf) {
         let _ = fs::remove_file(path);
     }
 }
+

@@ -65,9 +65,20 @@ is not running, nothing changes except that avatars are not saved.
     cp notification-avatar-daemon.service ~/.config/systemd/user/
     systemctl --user enable --now notification-avatar-daemon
 
-It idles at about 1 MB. Files are named after the sending app and a hash of
-the summary, because the monitor observes the `Notify` call while the
-notification id is only assigned in the reply.
+It idles at about 1 MB.
+
+Files go to `~/.local/state/omarchy/notifications/avatars/`, deliberately not
+the `images/` directory beside it: the shell sweeps that one at startup and
+deletes anything without a matching notification JSON, which every avatar
+would be.
+
+They are named after the sending app and a hash of the summary, because the
+monitor observes the `Notify` call while the notification id is only assigned
+in the reply. Two messages from the same contact therefore share a file, which
+is what you want: it is the same photo, kept current by the newer write.
+
+An avatar is deleted thirty days after that sender was last seen, matching how
+long the archive keeps entries, with a 500-file ceiling as a backstop.
 
 ## Keyboard
 
