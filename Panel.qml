@@ -691,14 +691,14 @@ Item {
                       ? Color.menu.selectedBackground
                       : "transparent")
                 border.width: modelData.active ? 0 : 1
-                border.color: Color.muted
+                border.color: Color.menu.border
 
                 Text {
                   id: chipLabel
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
                   text: modelData.label
-                  color: modelData.active ? Color.menu.selectedText : Color.muted
+                  color: modelData.active ? Color.menu.selectedText : Color.menu.text
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
@@ -743,7 +743,7 @@ Item {
             text: root.total === 0
               ? "Nothing archived yet. Every notification you receive is kept here for 30 days."
               : "No match. Try fewer words, or clear the filters with Escape."
-            color: Color.muted
+            color: Color.menu.text
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
@@ -945,7 +945,7 @@ Item {
                       textFormat: Text.PlainText
                       visible: (rowColumn.modelData.body || "") !== ""
                       text: rowColumn.modelData.body
-                      color: Color.muted
+                      color: Color.menu.text
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
@@ -1003,16 +1003,19 @@ Item {
                     Flow {
                       Layout.fillWidth: true
                       Layout.topMargin: Style.space(6)
-                      visible: rowColumn.isExpanded
+                      // Shown on the row the cursor is on, not only an
+                      // expanded one: otherwise nothing on screen says these
+                      // actions exist until you already know to press a key.
+                      visible: rowColumn.isExpanded || root.cursor === rowColumn.index
                       spacing: Style.space(6)
 
                       Repeater {
                         model: {
                           var acts = [
-                            { id: "pin", label: rowColumn.modelData.pinned ? "󰐃 Unpin" : "󰐃 Pin" },
-                            { id: "note", label: rowColumn.modelData.note ? "󰏫 Edit note" : "󰏫 Add note" },
-                            { id: "focus", label: "󰁔 Open app" },
-                            { id: "delete", label: "󰩹 Delete" }
+                            { id: "pin", label: (rowColumn.modelData.pinned ? "󰐃 Unpin" : "󰐃 Pin") + "  Ctrl+P" },
+                            { id: "note", label: (rowColumn.modelData.note ? "󰏫 Edit note" : "󰏫 Add note") + "  Ctrl+N" },
+                            { id: "focus", label: "󰁔 Open app  Enter" },
+                            { id: "delete", label: "󰩹 Delete  Ctrl+D" }
                           ]
                           for (var i = 0; i < root.groups.length; i++) {
                             var name = root.groups[i].name
@@ -1046,7 +1049,7 @@ Item {
                             text: modelData.label
                             color: String(modelData.id) === "delete"
                               ? Color.urgent
-                              : Color.muted
+                              : Color.menu.text
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                           }
@@ -1111,14 +1114,66 @@ Item {
 
           // ---------------------------------------------------- footer
 
-          Text {
+          // The shortcut bar. Drawn as keycaps rather than a sentence of
+          // "Ctrl+P pin · Ctrl+N note ·" because that run of punctuation at
+          // caption size in the muted colour is the thing nobody reads: the
+          // key needs to look like a key, and sit at normal text contrast.
+          Flow {
             Layout.fillWidth: true
-            textFormat: Text.PlainText
-            text: "↑↓ move · Enter open app · Shift+Enter expand · Ctrl+P pin · Ctrl+N note · Ctrl+G group · Ctrl+D delete · Tab filter by app · Esc back"
-            color: Color.muted
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
+            Layout.topMargin: Style.space(2)
+            spacing: Style.space(10)
+
+            Repeater {
+              model: [
+                { keys: ["↑", "↓"], label: "move" },
+                { keys: ["Enter"], label: "open app" },
+                { keys: ["⇧", "Enter"], label: "expand" },
+                { keys: ["Ctrl", "P"], label: "pin" },
+                { keys: ["Ctrl", "N"], label: "note" },
+                { keys: ["Ctrl", "G"], label: "group" },
+                { keys: ["Ctrl", "D"], label: "delete" },
+                { keys: ["Tab"], label: "by app" },
+                { keys: ["Esc"], label: "back" }
+              ]
+
+              delegate: Row {
+                required property var modelData
+                spacing: Style.space(4)
+
+                Repeater {
+                  model: parent.modelData.keys
+                  delegate: Rectangle {
+                    required property string modelData
+                    width: Math.max(capText.implicitWidth + Style.space(10), Style.space(20))
+                    height: Style.space(18)
+                    radius: Style.space(3)
+                    color: Color.menu.selectedBackground
+                    border.width: 1
+                    border.color: Color.menu.border
+
+                    Text {
+                      id: capText
+                      anchors.centerIn: parent
+                      textFormat: Text.PlainText
+                      text: modelData
+                      color: Color.menu.text
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: parent.modelData.label
+                  color: Color.menu.text
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
           }
         }
       }
