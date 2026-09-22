@@ -24,6 +24,18 @@ themed name stays resolvable forever, and an absolute path keeps working as
 long as the app is installed. Where neither survives, the app's own name is
 tried as a themed icon.
 
+## First run
+
+An empty archive is seeded once with five example entries, badged `example`,
+that demonstrate pinning, notes, groups and a silenced entry. They are only
+ever placed into an archive that has never held anything, so they cannot
+appear among real notifications, and deleting them is permanent: the fact
+that they were placed is recorded separately from whether any still exist.
+
+Remove them together with:
+
+    bin/notification-archive clear --samples
+
 ## Triage
 
 - **Pin** an entry to keep it past the retention window.

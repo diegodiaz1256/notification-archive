@@ -52,7 +52,10 @@ CREATE TABLE IF NOT EXISTS entries (
   important  INTEGER NOT NULL DEFAULT 0,
   unread     INTEGER NOT NULL DEFAULT 1,
   pinned     INTEGER NOT NULL DEFAULT 0,
-  note       TEXT NOT NULL DEFAULT ''
+  note       TEXT NOT NULL DEFAULT '',
+  -- Marks a row placed by seed_samples rather than received from the daemon,
+  -- so the panel can label it and clear the whole set in one action.
+  sample     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_entries_ts  ON entries(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_entries_app ON entries(app, timestamp DESC);
@@ -60,6 +63,16 @@ CREATE INDEX IF NOT EXISTS idx_entries_app ON entries(app, timestamp DESC);
 CREATE TABLE IF NOT EXISTS groups (
   name    TEXT PRIMARY KEY,
   created INTEGER NOT NULL
+);
+
+-- One-off facts about this database, rather than about any entry. Currently
+-- just whether the sample entries have been placed: that has to be recorded
+-- separately from whether any sample is still present, or deleting them (the
+-- expected thing to do once they have been read) would place them again on
+-- the next open.
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS entry_groups (
@@ -115,7 +128,21 @@ def connect():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    migrate(conn)
     return conn
+
+
+def migrate(conn):
+    """Bring an older database up to the current shape.
+
+    CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+    a column added after the first release has to be added by hand here.
+    """
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(entries)")}
+    if "sample" not in have:
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN sample INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
 
 
 def now_ms():
@@ -179,6 +206,116 @@ def cmd_ingest(conn, args):
     return {"ok": True, "stem": stem, "pruned": pruned}
 
 
+# ----------------------------------------------------------------- samples
+
+# Placed once, into an empty archive, so the panel explains itself on the
+# first open instead of showing "nothing archived yet" and leaving the
+# features to be discovered by accident.
+#
+# Each one demonstrates something real: a pinned entry that survives the
+# retention window, an entry carrying a note, two filed into a group, and one
+# marked silenced so the profile-muting case is visible. They are written as
+# advice about the archive rather than as imitation notifications, so nothing
+# here can be mistaken for something that actually arrived.
+SAMPLES = [
+    {
+        "app": "Notification Archive",
+        "summary": "Welcome to your notification archive",
+        "body": "Everything you receive is kept here for 30 days, including "
+                "notifications that were silenced and never appeared on screen. "
+                "Search with the box above; it matches anywhere inside a word.",
+        "minutes": 1,
+        "pinned": 1,
+        "note": "Pinned entries are never deleted, no matter how old.",
+    },
+    {
+        "app": "Notification Archive",
+        "summary": "Pin what matters, note why",
+        "body": "Ctrl+P pins the selected entry and Ctrl+N attaches a note. "
+                "Notes are searchable alongside the message itself.",
+        "minutes": 7,
+        "group": "Getting started",
+    },
+    {
+        "app": "Notification Archive",
+        "summary": "Group entries to keep them together",
+        "body": "Ctrl+G files an entry under a name of your choosing. Anything "
+                "in a group is kept past the 30 day window, the same as a pin.",
+        "minutes": 23,
+        "group": "Getting started",
+    },
+    {
+        "app": "Notification Archive",
+        "summary": "Silenced notifications land here too",
+        "body": "This one is marked as silenced: the bar down its left edge "
+                "means a profile muted it, so it was recorded without ever "
+                "interrupting you.",
+        "minutes": 95,
+        "silenced": 1,
+    },
+    {
+        "app": "Notification Archive",
+        "summary": "Clearing these samples",
+        "body": "Delete them like any other entry with Ctrl+D, or run "
+                "`notification-archive clear --samples` to remove all five at "
+                "once. They are only ever placed into an empty archive.",
+        "minutes": 240,
+    },
+]
+
+
+def seed_samples(conn):
+    """Place the sample entries, once, into an archive that has never held any.
+
+    Guarded by a flag in `meta` rather than by counting samples still present:
+    deleting them is the expected end state, and a count-based check would
+    read that as "not seeded yet" and put them straight back.
+    """
+    seeded = conn.execute(
+        "SELECT value FROM meta WHERE key = 'samples_seeded'").fetchone()
+    if seeded:
+        return 0
+    # Never seed an archive that already holds real notifications: this is a
+    # first-run explanation, not something to inject into an existing history.
+    count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    if count:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('samples_seeded', '1')")
+        conn.commit()
+        return 0
+
+    now = now_ms()
+    placed = 0
+    for index, sample in enumerate(SAMPLES):
+        timestamp = now - int(sample["minutes"]) * 60 * 1000
+        stem = "sample-%d" % index
+        conn.execute(
+            """
+            INSERT INTO entries
+              (stem, timestamp, app, app_icon, summary, body, urgency,
+               silenced, important, unread, pinned, note, sample)
+            VALUES (?, ?, ?, '', ?, ?, 1, ?, 0, 1, ?, ?, 1)
+            """,
+            (stem, timestamp, sample["app"], sample["summary"], sample["body"],
+             int(sample.get("silenced", 0)), int(sample.get("pinned", 0)),
+             sample.get("note", "")),
+        )
+        group = sample.get("group")
+        if group:
+            conn.execute(
+                "INSERT OR IGNORE INTO groups(name, created) VALUES (?, ?)",
+                (group, now))
+            conn.execute(
+                "INSERT OR IGNORE INTO entry_groups(stem, group_name) VALUES (?, ?)",
+                (stem, group))
+        placed += 1
+
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('samples_seeded', '1')")
+    conn.commit()
+    return placed
+
+
 def prune(conn):
     """Drop anything past retention that the user has not claimed.
 
@@ -192,6 +329,7 @@ def prune(conn):
         DELETE FROM entries
         WHERE timestamp < ?
           AND pinned = 0
+          AND sample = 0
           AND stem NOT IN (SELECT stem FROM entry_groups)
         """,
         (cutoff,),
@@ -221,6 +359,7 @@ def row_to_dict(row, groups_by_stem):
         "unread": bool(row["unread"]),
         "pinned": bool(row["pinned"]),
         "note": row["note"],
+        "sample": bool(row["sample"]),
         "groups": groups_by_stem.get(row["stem"], []),
     }
 
@@ -303,6 +442,9 @@ def fuzzy_fallback(conn, text, limit, where_sql, where_params):
 
 
 def cmd_list(conn, args):
+    # The panel calls this on open, which is the moment the samples are for.
+    seed_samples(conn)
+
     where = []
     params = []
     # The non-text filters, kept apart so a fuzzy fallback can reuse them:
@@ -439,6 +581,11 @@ def cmd_delete(conn, args):
 
 def cmd_clear(conn, args):
     """Bulk delete. Pinned and grouped entries are kept unless --force."""
+    if args.samples:
+        cur = conn.execute("DELETE FROM entries WHERE sample = 1")
+        conn.commit()
+        return {"ok": True, "deleted": cur.rowcount}
+
     where, params = [], []
     if args.app:
         where.append("app = ?")
@@ -569,6 +716,8 @@ def build_parser():
     p = sub.add_parser("clear")
     p.add_argument("--app"); p.add_argument("--before")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--samples", action="store_true",
+                   help="remove the first-run sample entries")
     p.set_defaults(fn=cmd_clear)
 
     p = sub.add_parser("group")

@@ -885,6 +885,29 @@ Item {
                         font.bold: true
                       }
 
+                      // Says outright that a row is an example rather than
+                      // something that arrived, so the first-run entries can
+                      // never be read as notifications that were missed.
+                      Rectangle {
+                        visible: rowColumn.modelData.sample === true
+                        width: sampleTag.implicitWidth + Style.space(8)
+                        height: Style.space(15)
+                        radius: Style.space(3)
+                        color: "transparent"
+                        border.width: 1
+                        border.color: Color.accent
+
+                        Text {
+                          id: sampleTag
+                          anchors.centerIn: parent
+                          textFormat: Text.PlainText
+                          text: "example"
+                          color: Color.accent
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+
                       Text {
                         textFormat: Text.PlainText
                         visible: rowColumn.modelData.pinned
