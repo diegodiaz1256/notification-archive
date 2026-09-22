@@ -328,6 +328,90 @@ Item {
 
   // ------------------------------------------------------------ helpers
 
+  // ------------------------------------------------------------ avatars
+  //
+  // Some senders deliver their image as raw pixels in the `image-data` hint
+  // rather than as a file path (Brave does, for WhatsApp). Those pixels never
+  // reach the shell's own storage: see avatar-daemon/, which captures them
+  // off the bus and writes a PNG here.
+  //
+  // The daemon cannot know the notification id -- it watches the method call,
+  // and the id is assigned in the reply -- so it names files after the sending
+  // app and a hash of the summary. This recomputes that name to find the file.
+
+  readonly property string avatarDir:
+    Quickshell.env("HOME") + "/.local/state/omarchy/notifications/avatars/"
+
+  // FNV-1a, 64-bit, matching avatar-daemon's fnv1a(). Carried as two 32-bit
+  // halves because a JavaScript number cannot hold a 64-bit integer exactly,
+  // and a rounded hash would name a file that does not exist.
+  function fnv1a(text) {
+    var hi = 0xcbf29ce4 >>> 0
+    var lo = 0x84222325 >>> 0
+    var bytes = root.utf8Bytes(String(text || ""))
+    for (var i = 0; i < bytes.length; i++) {
+      lo = (lo ^ bytes[i]) >>> 0
+      // Multiply the 64-bit value by the FNV prime, 0x100000001b3, in 16-bit
+      // pieces so no intermediate exceeds what a double represents exactly.
+      var l0 = lo & 0xffff, l1 = lo >>> 16, h0 = hi & 0xffff, h1 = hi >>> 16
+      var p0 = l0 * 0x01b3
+      var p1 = l1 * 0x01b3 + (p0 >>> 16)
+      var p2 = h0 * 0x01b3 + (p1 >>> 16)
+      var p3 = h1 * 0x01b3 + (p2 >>> 16)
+      var nlo = (((p1 & 0xffff) << 16) | (p0 & 0xffff)) >>> 0
+      var nhi = (((p3 & 0xffff) << 16) | (p2 & 0xffff)) >>> 0
+      // The prime's high word is 0x100, so the low half contributes this much
+      // to the high half.
+      nhi = (nhi + lo * 0x100) >>> 0
+      lo = nlo
+      hi = nhi
+    }
+    function hex8(value) {
+      var out = (value >>> 0).toString(16)
+      while (out.length < 8) out = "0" + out
+      return out
+    }
+    return hex8(hi) + hex8(lo)
+  }
+
+  // The daemon hashes the summary's UTF-8 bytes, so a name with an accent in
+  // it has to be encoded the same way rather than hashed as UTF-16 code units.
+  function utf8Bytes(text) {
+    var out = []
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i)
+      if (code < 0x80) {
+        out.push(code)
+      } else if (code < 0x800) {
+        out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f))
+      } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+        // Surrogate pair: combine into one code point before encoding.
+        var low = text.charCodeAt(i + 1)
+        var point = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00)
+        out.push(0xf0 | (point >> 18), 0x80 | ((point >> 12) & 0x3f),
+                 0x80 | ((point >> 6) & 0x3f), 0x80 | (point & 0x3f))
+        i++
+      } else {
+        out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f),
+                 0x80 | (code & 0x3f))
+      }
+    }
+    return out
+  }
+
+  // The path the daemon would have written for this entry. Whether it exists
+  // is left to the Image: a sender that never attached pixels simply has no
+  // file, and the icon falls back to the app's own.
+  function avatarPath(app, summary) {
+    var safe = ""
+    var name = String(app || "")
+    for (var i = 0; i < name.length && safe.length < 40; i++) {
+      var ch = name.charAt(i)
+      safe += /[A-Za-z0-9]/.test(ch) ? ch : "-"
+    }
+    return root.avatarDir + "avatar-" + safe + "-" + root.fnv1a(summary) + ".png"
+  }
+
   function iconSource(icon, app) {
     var value = String(icon || "")
     if (value.length === 0) {
@@ -776,6 +860,18 @@ Item {
               spacing: Style.space(4)
 
               readonly property bool isExpanded: root.expanded === modelData.stem
+              // Checked once per row: FileView reports a missing file without
+              // the warning an Image emits, and the answer decides whether the
+              // avatar is even attempted.
+              property bool avatarExists: false
+
+              FileView {
+                path: root.avatarPath(rowColumn.modelData.app, rowColumn.modelData.summary)
+                blockLoading: false
+                printErrors: false
+                onLoaded: rowColumn.avatarExists = true
+                onLoadFailed: rowColumn.avatarExists = false
+              }
 
               Text {
                 visible: root.startsNewDay(rowColumn.index)
@@ -854,14 +950,41 @@ Item {
                     Layout.topMargin: Style.space(2)
                     width: Style.space(26)
                     height: Style.space(26)
-                    radius: Style.spacing.labelGap
+                    // Round for a captured avatar, which is a person, and
+                    // square-ish for an app icon, which is a logo.
+                    radius: entryAvatar.status === Image.Ready
+                      ? width / 2
+                      : Style.spacing.labelGap
                     color: Color.menu.selectedBackground
-                    visible: entryIcon.status === Image.Ready
+                    visible: entryAvatar.status === Image.Ready
+                      || entryIcon.status === Image.Ready
+                    clip: true
+
+                    // The sender's own image, when avatar-daemon captured one.
+                    // It identifies the contact rather than the app, so it
+                    // wins over the app icon; the app icon shows through when
+                    // there is no file, which is every sender that does not
+                    // attach pixels.
+                    Image {
+                      id: entryAvatar
+                      anchors.fill: parent
+                      // Most senders attach no pixels, so most rows have no
+                      // file here. Qt logs a warning per missing source, which
+                      // would mean a line of shell log for every ordinary
+                      // notification, so the path is only handed over once the
+                      // file is known to exist.
+                      source: rowColumn.avatarExists
+                        ? root.avatarPath(rowColumn.modelData.app, rowColumn.modelData.summary)
+                        : ""
+                      fillMode: Image.PreserveAspectCrop
+                      asynchronous: true
+                    }
 
                     Image {
                       id: entryIcon
                       anchors.fill: parent
                       anchors.margins: Style.space(4)
+                      visible: entryAvatar.status !== Image.Ready
                       source: root.iconSource(rowColumn.modelData.appIcon, rowColumn.modelData.app)
                       fillMode: Image.PreserveAspectFit
                       asynchronous: true

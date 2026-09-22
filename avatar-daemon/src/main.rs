@@ -25,9 +25,7 @@
 //! contact collide on that name, which is correct -- it is the same photo, and
 //! the newer write keeps it current.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -345,15 +343,31 @@ fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
 /// the monitor observes the method call, and the id is assigned in the reply.
 /// App and summary are what both sides do have, and together they identify
 /// the sender and the contact the avatar belongs to.
+///
+/// The panel has to derive this same name to find the file, so the hash must
+/// be one it can reproduce. FNV-1a over the summary's UTF-8 bytes is specified
+/// and a few lines in any language; Rust's DefaultHasher is neither, since its
+/// algorithm is explicitly an unstable implementation detail that a compiler
+/// upgrade may change, which would orphan every file already written.
 fn stem(app: &str, summary: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    summary.hash(&mut hasher);
     let safe: String = app
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .take(40)
         .collect();
-    format!("avatar-{}-{:016x}", safe, hasher.finish())
+    format!("avatar-{}-{:016x}", safe, fnv1a(summary))
+}
+
+/// FNV-1a, 64-bit, over UTF-8 bytes. Chosen for being reproducible elsewhere
+/// rather than for collision resistance: a collision here means two contacts
+/// of the same app sharing an avatar, which the next capture corrects.
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Expire avatars that have outlived their usefulness.
