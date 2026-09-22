@@ -151,8 +151,16 @@ fn handle(msg: &Message, dir: &PathBuf) -> Result<(), String> {
         None => return Ok(()),
     };
 
-    // The hint is a dict; the value we want is one of three spellings,
-    // depending on how old the sender's libnotify is.
+    // Two ways a sender delivers an image, and both have to be handled.
+    //
+    // `image-path` is a file, and Chromium-family senders use it: Brave points
+    // it at its own scoped /tmp directory, which it deletes as soon as the
+    // notification closes. Copying that file promptly is the whole job.
+    //
+    // `image-data` is raw pixels inline. The shell can render those but never
+    // persists them, since Quickshell exposes them as an in-process URL that
+    // dies with the notification.
+    let mut path_hint: Option<String> = None;
     let mut image: Option<&dyn dbus::arg::RefArg> = None;
     if let Some(mut entries) = hints.as_iter() {
         while let Some(key) = entries.next() {
@@ -170,8 +178,45 @@ fn handle(msg: &Message, dir: &PathBuf) -> Result<(), String> {
                         break;
                     }
                 }
+                Some("image-path") | Some("image_path") => {
+                    if let Some(text) = value.as_str() {
+                        path_hint = Some(text.to_string());
+                    }
+                }
                 _ => {}
             }
+        }
+    }
+
+    let target = dir.join(format!("{}.png", stem(&app, &summary)));
+
+    // A file path is the common case and needs no decoding, just a prompt
+    // copy: the sender owns that file and deletes it when the notification
+    // closes, which for Brave is within seconds.
+    if let Some(source) = path_hint {
+        let source = source.strip_prefix("file://").unwrap_or(&source).to_string();
+        if !source.is_empty() && image.is_none() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
+            }
+            let tmp = target.with_extension("png.tmp");
+            // Copied as-is: it is already a PNG in every sender seen, and
+            // re-encoding would mean decoding formats this has no need to know.
+            match fs::copy(&source, &tmp) {
+                Ok(_) => {
+                    fs::rename(&tmp, &target)
+                        .map_err(|e| format!("rename {target:?}: {e}"))?;
+                    trim(dir);
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(&tmp);
+                    // The sender may have deleted it already; nothing to do.
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        return Err(format!("copy {source:?}: {err}"));
+                    }
+                }
+            }
+            return Ok(());
         }
     }
 
@@ -185,7 +230,7 @@ fn handle(msg: &Message, dir: &PathBuf) -> Result<(), String> {
         None => return Ok(()),
     };
 
-    let path = dir.join(format!("{}.png", stem(&app, &summary)));
+    let path = target;
     let png = encode_png(&pixels)?;
 
     // Created per write, not once at startup: the directory lives under
@@ -349,13 +394,16 @@ fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
 /// and a few lines in any language; Rust's DefaultHasher is neither, since its
 /// algorithm is explicitly an unstable implementation detail that a compiler
 /// upgrade may change, which would orphan every file already written.
-fn stem(app: &str, summary: &str) -> String {
-    let safe: String = app
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .take(40)
-        .collect();
-    format!("avatar-{}-{:016x}", safe, fnv1a(summary))
+fn stem(_app: &str, summary: &str) -> String {
+    // Keyed on the summary alone, deliberately not on the app name.
+    //
+    // The shell rewrites a Chromium webapp's identity before storing it: a
+    // WhatsApp notification arrives here as app_name "Brave Origin" and is
+    // recorded by the shell as "WhatsApp", so a name built from what this
+    // process sees would never match what the panel looks up. The summary is
+    // the one field both sides agree on, and for a chat notification it is the
+    // contact, which is exactly what the avatar depicts.
+    format!("avatar-{:016x}", fnv1a(summary))
 }
 
 /// FNV-1a, 64-bit, over UTF-8 bytes. Chosen for being reproducible elsewhere

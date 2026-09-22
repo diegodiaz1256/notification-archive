@@ -345,7 +345,7 @@ Item {
   // FNV-1a, 64-bit, matching avatar-daemon's fnv1a(). Carried as two 32-bit
   // halves because a JavaScript number cannot hold a 64-bit integer exactly,
   // and a rounded hash would name a file that does not exist.
-  function fnv1a(text) {
+  function avatarHash(text) {
     var hi = 0xcbf29ce4 >>> 0
     var lo = 0x84222325 >>> 0
     var bytes = root.utf8Bytes(String(text || ""))
@@ -402,15 +402,42 @@ Item {
   // The path the daemon would have written for this entry. Whether it exists
   // is left to the Image: a sender that never attached pixels simply has no
   // file, and the icon falls back to the app's own.
-  function avatarPath(app, summary) {
-    var safe = ""
-    var name = String(app || "")
-    for (var i = 0; i < name.length && safe.length < 40; i++) {
-      var ch = name.charAt(i)
-      safe += /[A-Za-z0-9]/.test(ch) ? ch : "-"
-    }
-    return root.avatarDir + "avatar-" + safe + "-" + root.fnv1a(summary) + ".png"
+  // Chromium-family senders lead the body with the sending page's own URL, as
+  // a link tag or a bare host, and the daemon's live toast strips it as
+  // display noise. The archive stores the body exactly as it arrived, so a
+  // WhatsApp entry otherwise reads as a literal
+  // `<a href="https://web.whatsapp.com/">web.whatsapp.com</a>` before the
+  // message itself.
+  //
+  // Rendered as plain text rather than StyledText on purpose: a notification
+  // body is attacker-controlled, and the only markup worth honouring here is
+  // the part being removed. Anything left over is shown literally, which is
+  // safe and honest, so the tags are stripped instead of interpreted.
+  function displayBody(body) {
+    var text = String(body || "")
+    // A leading anchor tag, which is how Chromium sends it.
+    text = text.replace(/^\s*<a\b[^>]*>\s*(?:https?:\/\/|www\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/[^<\s]*)?\s*<\/a>\s*/i, "")
+    // The same thing as a bare host on its own line.
+    text = text.replace(/^\s*(?:https?:\/\/|www\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/\S*)?\s+/i, "")
+    // Any remaining tags: senders that set body-markup use <b>, <i> and <br>,
+    // none of which mean anything to a PlainText field.
+    text = text.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]*>/g, "")
+    // Entities the markup capability defines, so a stripped body does not
+    // leave "&amp;" behind.
+    text = text.replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+               .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+               .replace(/&amp;/g, "&")
+    return text.replace(/^\s+|\s+$/g, "")
   }
+
+  // Keyed on the summary alone, matching the daemon. The shell rewrites a
+  // Chromium webapp's identity ("Brave Origin" becomes "WhatsApp"), so the app
+  // name differs between what the daemon sees on the bus and what is stored
+  // here; the summary is the field both sides agree on.
+  function avatarPath(app, summary) {
+    return root.avatarDir + "avatar-" + root.avatarHash(summary) + ".png"
+  }
+
 
   function iconSource(icon, app) {
     var value = String(icon || "")
@@ -1089,8 +1116,8 @@ Item {
                     Text {
                       Layout.fillWidth: true
                       textFormat: Text.PlainText
-                      visible: (rowColumn.modelData.body || "") !== ""
-                      text: rowColumn.modelData.body
+                      visible: root.displayBody(rowColumn.modelData.body) !== ""
+                      text: root.displayBody(rowColumn.modelData.body)
                       color: Color.menu.text
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
