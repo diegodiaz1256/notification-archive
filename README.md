@@ -34,6 +34,26 @@ tried as a themed icon.
 Pinned and grouped entries are never removed by retention. Everything else is
 dropped thirty days after it arrived.
 
+## Keyboard
+
+The panel is fully keyboard driven; typing goes to the search box and the
+navigation keys are forwarded past it.
+
+| Key | Action |
+| --- | --- |
+| `↑` `↓`, `Ctrl+K` `Ctrl+J` | Move the cursor |
+| `PageUp` `PageDown` | Move by ten |
+| `Ctrl+Home` `Ctrl+End` | First, last |
+| `Enter` | Open the sending app |
+| `Shift+Enter`, `Ctrl+Space` | Expand in place |
+| `Ctrl+P` | Pin or unpin |
+| `Ctrl+N` | Add or edit a note |
+| `Ctrl+G` | File into a group |
+| `Ctrl+D`, `Delete` | Delete |
+| `Ctrl+U` | Unread only |
+| `Tab`, `Shift+Tab` | Cycle the app filter |
+| `Esc` | Back out one layer, then close |
+
 ## Search
 
 The index is a trigram FTS5 table, so a query matches anywhere inside a word:

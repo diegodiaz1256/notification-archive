@@ -74,10 +74,31 @@ Item {
 
   readonly property string helper: root.sourceDir + "/bin/notification-archive"
 
-  function open() {
+  function open(payloadJson) {
+    // Every summon starts clean. The panel is long-lived and the database
+    // moves underneath it -- notifications arrive, entries age out -- so
+    // reopening has to re-read rather than repaint whatever the last session
+    // left behind, which is how a stale count could sit above an empty list.
+    root.entries = []
+    root.total = 0
+    root.unreadCount = 0
+    root.query = ""
+    root.appFilter = ""
+    root.groupFilter = ""
+    root.pinnedOnly = false
+    root.unreadOnly = false
+    root.expanded = ""
+    root.editingNote = ""
+    root.newGroupFor = ""
+    root.cursor = 0
+    root.error = ""
     root.opened = true
+    // startHelper refreshes on its own once the helper answers "ready"; this
+    // second call covers the case where it is already running from a previous
+    // summon and will send no greeting.
     root.startHelper()
     root.refresh()
+    root.send({ cmd: "groups" })
   }
 
   function close() {
@@ -220,6 +241,40 @@ Item {
     return root.entries[index]
   }
 
+  // Cursor movement is clamped rather than wrapped: wrapping from the last
+  // entry back to the first reads as a jump when the list is long, and the
+  // ends are where a user stops deliberately.
+  function setCursor(index) {
+    if (root.entries.length === 0) { root.cursor = 0; return }
+    root.cursor = Math.max(0, Math.min(index, root.entries.length - 1))
+    // Expanding follows the cursor when a row is already expanded, so arrowing
+    // through a list in "read" mode keeps showing the body rather than
+    // collapsing on the first keypress.
+    if (root.expanded !== "") {
+      var entry = root.entryAt(root.cursor)
+      if (entry) {
+        root.expanded = entry.stem
+        root.markRead(entry)
+      }
+    }
+  }
+
+  function moveCursor(delta) {
+    root.setCursor(root.cursor + delta)
+  }
+
+  // Steps through the apps the filter chips show, plus "no filter" as the
+  // first stop, so Tab cycles the same set the mouse can click.
+  function cycleAppFilter(direction) {
+    if (root.apps.length === 0) return
+    var names = [""]
+    for (var i = 0; i < root.apps.length; i++) names.push(root.apps[i].app)
+    var at = names.indexOf(root.appFilter)
+    if (at < 0) at = 0
+    var next = (at + direction + names.length) % names.length
+    root.appFilter = names[next]
+  }
+
   function togglePin(entry) {
     if (!entry) return
     root.send({ cmd: "set", stem: [entry.stem], pinned: entry.pinned ? "false" : "true" })
@@ -355,17 +410,114 @@ Item {
       anchors.fill: parent
       focus: true
 
-      Keys.onEscapePressed: {
-        // Escape backs out one layer at a time: an open note editor, then a
-        // search or filter, then the panel itself.
-        if (root.editingNote !== "") root.editingNote = ""
-        else if (root.query !== "") root.query = ""
-        else if (root.appFilter !== "" || root.groupFilter !== "" || root.pinnedOnly || root.unreadOnly) {
-          root.appFilter = ""
-          root.groupFilter = ""
-          root.pinnedOnly = false
-          root.unreadOnly = false
-        } else root.close()
+      // Everything reachable by mouse is reachable from the keyboard, since
+      // this panel opens over whatever the user was doing and reaching for
+      // the mouse to triage a list is what makes it not worth opening.
+      //
+      // Typing goes to the search box, so the list keys are the ones a text
+      // field does not want: arrows, Tab, and Ctrl chords. Plain letters stay
+      // with the search field.
+      Keys.onPressed: function(event) {
+        var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
+        var entry = root.entryAt(root.cursor)
+
+        // --- leaving ---
+        if (event.key === Qt.Key_Escape) {
+          if (root.newGroupFor !== "") root.newGroupFor = ""
+          else if (root.editingNote !== "") root.editingNote = ""
+          else if (root.expanded !== "") root.expanded = ""
+          else if (root.query !== "") root.query = ""
+          else if (root.appFilter !== "" || root.groupFilter !== ""
+                   || root.pinnedOnly || root.unreadOnly) {
+            root.appFilter = ""
+            root.groupFilter = ""
+            root.pinnedOnly = false
+            root.unreadOnly = false
+          } else root.close()
+          event.accepted = true
+          return
+        }
+
+        // While a note or group name is being typed, the list keys belong to
+        // that field: Enter commits it, Escape above cancels it.
+        if (root.editingNote !== "" || root.newGroupFor !== "") return
+
+        // --- moving ---
+        if (event.key === Qt.Key_Down || (ctrl && event.key === Qt.Key_J)) {
+          root.moveCursor(1)
+          event.accepted = true
+          return
+        }
+        if (event.key === Qt.Key_Up || (ctrl && event.key === Qt.Key_K)) {
+          root.moveCursor(-1)
+          event.accepted = true
+          return
+        }
+        if (event.key === Qt.Key_PageDown) { root.moveCursor(10); event.accepted = true; return }
+        if (event.key === Qt.Key_PageUp) { root.moveCursor(-10); event.accepted = true; return }
+        if (event.key === Qt.Key_Home && ctrl) { root.setCursor(0); event.accepted = true; return }
+        if (event.key === Qt.Key_End && ctrl) {
+          root.setCursor(root.entries.length - 1)
+          event.accepted = true
+          return
+        }
+
+        // --- acting on the row under the cursor ---
+        if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+          if (!entry) return
+          // Enter opens the app, which is the one thing an archived entry can
+          // still do; Shift+Enter expands it instead, for reading in place.
+          if (event.modifiers & Qt.ShiftModifier) {
+            root.expanded = root.expanded === entry.stem ? "" : entry.stem
+            root.markRead(entry)
+          } else {
+            root.focusApp(entry)
+          }
+          event.accepted = true
+          return
+        }
+        if (event.key === Qt.Key_Space && ctrl) {
+          if (entry) {
+            root.expanded = root.expanded === entry.stem ? "" : entry.stem
+            root.markRead(entry)
+          }
+          event.accepted = true
+          return
+        }
+        if (ctrl && event.key === Qt.Key_P) { root.togglePin(entry); event.accepted = true; return }
+        if (ctrl && event.key === Qt.Key_N) {
+          if (entry) { root.expanded = entry.stem; root.editingNote = entry.stem }
+          event.accepted = true
+          return
+        }
+        if (ctrl && event.key === Qt.Key_G) {
+          if (entry) { root.expanded = entry.stem; root.newGroupFor = entry.stem }
+          event.accepted = true
+          return
+        }
+        if (ctrl && event.key === Qt.Key_D) { root.removeEntry(entry); event.accepted = true; return }
+        if (event.key === Qt.Key_Delete) { root.removeEntry(entry); event.accepted = true; return }
+
+        // --- filters ---
+        if (ctrl && event.key === Qt.Key_U) { root.unreadOnly = !root.unreadOnly; event.accepted = true; return }
+        if (ctrl && event.key === Qt.Key_L) {
+          // Cycle the app filter with Tab-like stepping, so a keyboard user can
+          // narrow to one sender without reaching for its chip.
+          root.cycleAppFilter(1)
+          event.accepted = true
+          return
+        }
+        if (event.key === Qt.Key_Backtab
+            || (event.key === Qt.Key_Tab && (event.modifiers & Qt.ShiftModifier))) {
+          root.cycleAppFilter(-1)
+          event.accepted = true
+          return
+        }
+        if (event.key === Qt.Key_Tab) {
+          root.cycleAppFilter(1)
+          event.accepted = true
+          return
+        }
       }
 
       Rectangle {
@@ -390,8 +542,8 @@ Item {
 
             Text {
               textFormat: Text.PlainText
-              text: "󰂚"
-              color: Color.foreground
+              text: "󰂺"
+              color: Color.menu.text
               font.family: root.fontFamily
               font.pixelSize: Style.font.subtitle
             }
@@ -400,7 +552,7 @@ Item {
               Layout.fillWidth: true
               textFormat: Text.PlainText
               text: "Notification archive"
-              color: Color.foreground
+              color: Color.menu.text
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
@@ -412,7 +564,7 @@ Item {
               text: root.unreadCount > 0
                 ? root.entries.length + " of " + root.total + " · " + root.unreadCount + " unread"
                 : root.entries.length + " of " + root.total
-              color: Qt.darker(Color.foreground, 1.5)
+              color: Color.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
@@ -424,7 +576,7 @@ Item {
             Layout.fillWidth: true
             height: Style.space(36)
             radius: Style.spacing.labelGap
-            color: Qt.darker(Color.menu.background, 1.15)
+            color: Color.menu.selectedBackground
             border.width: 1
             border.color: searchInput.activeFocus ? Color.accent : Color.menu.border
 
@@ -437,7 +589,7 @@ Item {
               Text {
                 textFormat: Text.PlainText
                 text: "󰍉"
-                color: Qt.darker(Color.foreground, 1.6)
+                color: Color.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
               }
@@ -446,12 +598,26 @@ Item {
                 id: searchInput
                 Layout.fillWidth: true
                 focus: root.opened
-                color: Color.foreground
+                color: Color.menu.text
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 selectByMouse: true
                 clip: true
                 onTextChanged: root.query = text
+                // Typing belongs to this field, but navigation does not: the
+                // list keys are forwarded up so the cursor can move while the
+                // caret stays here and the next letter still lands in the
+                // search box.
+                Keys.onPressed: function(event) {
+                  if (event.key === Qt.Key_Down || event.key === Qt.Key_Up
+                      || event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp
+                      || event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                      || event.key === Qt.Key_Escape || event.key === Qt.Key_Tab
+                      || event.key === Qt.Key_Backtab || event.key === Qt.Key_Delete
+                      || (event.modifiers & Qt.ControlModifier)) {
+                    event.accepted = false
+                  }
+                }
 
                 // Cleared from outside (Escape) without fighting the cursor
                 // while typing.
@@ -466,7 +632,7 @@ Item {
                   anchors.verticalCenter: parent.verticalCenter
                   visible: searchInput.text === ""
                   text: "Search everything received in the last 30 days"
-                  color: Qt.darker(Color.foreground, 1.8)
+                  color: Color.muted
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                 }
@@ -520,19 +686,19 @@ Item {
                 width: chipLabel.implicitWidth + Style.space(18)
                 radius: height / 2
                 color: modelData.active
-                  ? Style.selectedFillFor(Color.foreground, Color.accent)
+                  ? Color.menu.selectedBackground
                   : (chipMouse.containsMouse
-                      ? Style.hoverFillFor(Color.foreground, Color.accent)
+                      ? Color.menu.selectedBackground
                       : "transparent")
                 border.width: modelData.active ? 0 : 1
-                border.color: Qt.darker(Color.foreground, 2.4)
+                border.color: Color.muted
 
                 Text {
                   id: chipLabel
                   anchors.centerIn: parent
                   textFormat: Text.PlainText
                   text: modelData.label
-                  color: modelData.active ? Color.foreground : Qt.darker(Color.foreground, 1.5)
+                  color: modelData.active ? Color.menu.selectedText : Color.muted
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
@@ -577,7 +743,7 @@ Item {
             text: root.total === 0
               ? "Nothing archived yet. Every notification you receive is kept here for 30 days."
               : "No match. Try fewer words, or clear the filters with Escape."
-            color: Qt.darker(Color.foreground, 1.6)
+            color: Color.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
@@ -594,6 +760,13 @@ Item {
             spacing: Style.space(4)
             currentIndex: root.cursor
             boundsBehavior: Flickable.StopAtBounds
+            // Without this the cursor can walk off the visible area and the
+            // list appears frozen while the selection moves out of sight.
+            highlightFollowsCurrentItem: true
+            highlightMoveDuration: 90
+            preferredHighlightBegin: height * 0.15
+            preferredHighlightEnd: height * 0.85
+            highlightRangeMode: ListView.ApplyRange
 
             delegate: Column {
               id: rowColumn
@@ -607,7 +780,7 @@ Item {
               Text {
                 visible: root.startsNewDay(rowColumn.index)
                 text: root.headingFor(rowColumn.index)
-                color: Qt.darker(Color.foreground, 1.7)
+                color: Color.muted
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 font.bold: true
@@ -617,11 +790,27 @@ Item {
 
               Rectangle {
                 width: parent.width
+                // Follows the layout rather than a fixed guess, so expanding a
+                // row (which adds the action buttons and unclamps the text)
+                // actually makes room for what appears. Binding this to an
+                // anchored child's implicitHeight left the extra content
+                // drawn outside the row and clipped away by the ListView.
                 height: entryBody.implicitHeight + Style.space(16)
                 radius: Style.spacing.labelGap
-                color: rowMouse.containsMouse || rowColumn.isExpanded
-                  ? Style.hoverFillFor(Color.foreground, Color.accent)
+                readonly property bool isCursor: root.cursor === rowColumn.index
+                color: rowMouse.containsMouse || rowColumn.isExpanded || isCursor
+                  ? Color.menu.selectedBackground
                   : "transparent"
+                // A left edge marks where the keyboard is, distinct from the
+                // fill a mouse hover paints, so the two are never confused.
+                Rectangle {
+                  visible: parent.isCursor
+                  width: Style.space(2)
+                  height: parent.height
+                  anchors.left: parent.left
+                  radius: width
+                  color: Color.accent
+                }
 
                 // A thin accent bar marks an entry that never reached the
                 // screen, so "I never saw this" is visible while scanning
@@ -633,7 +822,7 @@ Item {
                   anchors.left: parent.left
                   anchors.verticalCenter: parent.verticalCenter
                   radius: width
-                  color: Qt.darker(Color.foreground, 2.0)
+                  color: Color.muted
                 }
 
                 MouseArea {
@@ -655,11 +844,9 @@ Item {
 
                 RowLayout {
                   id: entryBody
-                  anchors.left: parent.left
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  anchors.leftMargin: Style.space(10)
-                  anchors.rightMargin: Style.space(8)
+                  x: Style.space(10)
+                  y: Style.space(8)
+                  width: parent.width - Style.space(18)
                   spacing: Style.space(10)
 
                   Rectangle {
@@ -668,7 +855,7 @@ Item {
                     width: Style.space(26)
                     height: Style.space(26)
                     radius: Style.spacing.labelGap
-                    color: Style.normalFillFor(Color.foreground, Color.accent)
+                    color: Color.menu.selectedBackground
                     visible: entryIcon.status === Image.Ready
 
                     Image {
@@ -692,7 +879,7 @@ Item {
                       Text {
                         textFormat: Text.PlainText
                         text: rowColumn.modelData.app || "Unknown"
-                        color: Color.foreground
+                        color: Color.menu.text
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         font.bold: true
@@ -711,7 +898,7 @@ Item {
                         textFormat: Text.PlainText
                         visible: rowColumn.modelData.note !== ""
                         text: "󰏫"
-                        color: Qt.darker(Color.foreground, 1.6)
+                        color: Color.muted
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                       }
@@ -722,7 +909,7 @@ Item {
                           required property string modelData
                           textFormat: Text.PlainText
                           text: "󰓹 " + modelData
-                          color: Qt.darker(Color.foreground, 1.5)
+                          color: Color.muted
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
                         }
@@ -733,7 +920,7 @@ Item {
                       Text {
                         textFormat: Text.PlainText
                         text: root.relativeTime(rowColumn.modelData.timestamp)
-                        color: Qt.darker(Color.foreground, 1.7)
+                        color: Color.muted
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                       }
@@ -744,7 +931,7 @@ Item {
                       textFormat: Text.PlainText
                       visible: (rowColumn.modelData.summary || "") !== ""
                       text: rowColumn.modelData.summary
-                      color: Color.foreground
+                      color: Color.menu.text
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       font.bold: rowColumn.modelData.unread
@@ -758,7 +945,7 @@ Item {
                       textFormat: Text.PlainText
                       visible: (rowColumn.modelData.body || "") !== ""
                       text: rowColumn.modelData.body
-                      color: Qt.darker(Color.foreground, 1.4)
+                      color: Color.muted
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
                       elide: Text.ElideRight
@@ -784,7 +971,7 @@ Item {
                       visible: root.editingNote === rowColumn.modelData.stem
                       height: Style.space(30)
                       radius: Style.spacing.labelGap
-                      color: Qt.darker(Color.menu.background, 1.2)
+                      color: Color.menu.selectedBackground
                       border.width: 1
                       border.color: Color.accent
 
@@ -794,7 +981,7 @@ Item {
                         anchors.leftMargin: Style.space(8)
                         anchors.rightMargin: Style.space(8)
                         verticalAlignment: TextInput.AlignVCenter
-                        color: Color.foreground
+                        color: Color.menu.text
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         selectByMouse: true
@@ -845,12 +1032,12 @@ Item {
                           width: actionLabel.implicitWidth + Style.space(16)
                           radius: Style.spacing.labelGap
                           color: actionMouse.containsMouse
-                            ? Style.hoverFillFor(Color.foreground, Color.accent)
+                            ? Color.menu.selectedBackground
                             : "transparent"
                           border.width: 1
                           border.color: String(modelData.id) === "delete"
-                            ? Qt.darker(Color.urgent, 1.4)
-                            : Qt.darker(Color.foreground, 2.4)
+                            ? Color.urgent
+                            : Color.muted
 
                           Text {
                             id: actionLabel
@@ -859,7 +1046,7 @@ Item {
                             text: modelData.label
                             color: String(modelData.id) === "delete"
                               ? Color.urgent
-                              : Qt.darker(Color.foreground, 1.3)
+                              : Color.muted
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
                           }
@@ -894,7 +1081,7 @@ Item {
                       visible: root.newGroupFor === rowColumn.modelData.stem
                       height: Style.space(30)
                       radius: Style.spacing.labelGap
-                      color: Qt.darker(Color.menu.background, 1.2)
+                      color: Color.menu.selectedBackground
                       border.width: 1
                       border.color: Color.accent
 
@@ -904,7 +1091,7 @@ Item {
                         anchors.leftMargin: Style.space(8)
                         anchors.rightMargin: Style.space(8)
                         verticalAlignment: TextInput.AlignVCenter
-                        color: Color.foreground
+                        color: Color.menu.text
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         selectByMouse: true
@@ -927,8 +1114,8 @@ Item {
           Text {
             Layout.fillWidth: true
             textFormat: Text.PlainText
-            text: "Click to expand · Right-click opens the app · Pinned and grouped entries are never auto-deleted"
-            color: Qt.darker(Color.foreground, 1.8)
+            text: "↑↓ move · Enter open app · Shift+Enter expand · Ctrl+P pin · Ctrl+N note · Ctrl+G group · Ctrl+D delete · Tab filter by app · Esc back"
+            color: Color.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight
