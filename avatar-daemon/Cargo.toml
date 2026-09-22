@@ -1,0 +1,21 @@
+[package]
+name = "notification-avatar-daemon"
+version = "1.0.0"
+edition = "2021"
+description = "Captures notification image-data avatars that die with the notification"
+license = "MIT"
+
+[dependencies]
+# libdbus bindings. Chosen over zbus because this is a read-only message
+# filter: it needs one blocking loop, not an async runtime.
+dbus = "0.9"
+# Deflate for the PNG stream. The image crate would pull decoders, resizing
+# and a dozen formats to write one uncompressed-source RGBA file.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -46,6 +46,29 @@ Remove them together with:
 Pinned and grouped entries are never removed by retention. Everything else is
 dropped thirty days after it arrived.
 
+## Avatars
+
+Some senders deliver their image as raw pixels in the freedesktop
+`image-data` hint rather than as a file path. Brave does this for WhatsApp
+web notifications, which is why the contact photo appears on the toast and
+nowhere afterwards: Quickshell turns those pixels into an in-process URL that
+dies with the notification, and strips the hint from what it exposes to QML,
+so the shell cannot reach the pixels to save them.
+
+`avatar-daemon/` is a small Rust daemon that watches the session bus as a
+passive monitor and writes those pixels to a PNG. It uses `BecomeMonitor`,
+which is read-only: it never owns the notification bus name, so the shell's
+own daemon keeps receiving and displaying everything exactly as before. If it
+is not running, nothing changes except that avatars are not saved.
+
+    cd avatar-daemon && cargo build --release
+    cp notification-avatar-daemon.service ~/.config/systemd/user/
+    systemctl --user enable --now notification-avatar-daemon
+
+It idles at about 1 MB. Files are named after the sending app and a hash of
+the summary, because the monitor observes the `Notify` call while the
+notification id is only assigned in the reply.
+
 ## Keyboard
 
 The panel is fully keyboard driven; typing goes to the search box and the

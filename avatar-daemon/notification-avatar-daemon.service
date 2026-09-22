@@ -1,0 +1,29 @@
+[Unit]
+Description=Capture notification avatars delivered as image-data
+Documentation=https://github.com/diegodiaz1256/notification-archive
+# The session bus is the only thing it needs; the shell can start later or
+# restart freely, since this never talks to it.
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/plugins/zeroge.notification-archive/avatar-daemon/target/release/notification-avatar-daemon
+Restart=on-failure
+RestartSec=5
+
+# It reads one bus and writes PNGs into one directory. Nothing else is needed,
+# and a monitor connection sees every notification on the session bus, so it is
+# worth confining.
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=graphical-session.target

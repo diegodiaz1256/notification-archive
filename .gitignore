@@ -9,3 +9,6 @@ __pycache__/
 *.db-wal
 *.db-shm
 *.sqlite*
+
+# Rust build output
+avatar-daemon/target/
