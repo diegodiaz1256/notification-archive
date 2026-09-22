@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""Searchable long-term store for notifications, behind one SQLite database.
+
+The notification daemon keeps only the newest ten notifications, as one JSON
+file each, because that set exists to be replayed as toasts. This archive is
+the other half: every notification that was ever finalized, kept for thirty
+days, so it can be searched and triaged long after its toast is gone.
+
+Every subcommand prints JSON on stdout, so the QML panel never has to parse
+anything but one object.
+
+Identity is the entry's "<timestamp>-<originalId>" stem, the same string the
+daemon names its files after. Ingest is INSERT ... ON CONFLICT DO UPDATE on
+that key, so the daemon replaying or retrying a write can never duplicate a
+row, and an in-place update (a client editing its own notification through
+replaces_id) lands on the row it already wrote.
+
+Icons are deliberately NOT copied. The daemon's own image copies live and die
+with its ten-entry history, so a path into that directory would be dangling
+within minutes. What is stored instead is the icon as it arrived, before the
+daemon rewrote it for persistence: a themed name like "whatsapp" stays
+resolvable forever, and an absolute path keeps working as long as the app is
+installed. The app name is stored alongside it as a fallback for the panel to
+resolve when neither survives.
+"""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "omarchy", "notifications")
+DB_PATH = os.path.join(STATE_DIR, "archive.db")
+
+RETENTION_DAYS = 30
+RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS entries (
+  stem       TEXT PRIMARY KEY,
+  timestamp  INTEGER NOT NULL,
+  app        TEXT NOT NULL DEFAULT '',
+  app_icon   TEXT NOT NULL DEFAULT '',
+  summary    TEXT NOT NULL DEFAULT '',
+  body       TEXT NOT NULL DEFAULT '',
+  urgency    INTEGER NOT NULL DEFAULT 1,
+  silenced   INTEGER NOT NULL DEFAULT 0,
+  important  INTEGER NOT NULL DEFAULT 0,
+  unread     INTEGER NOT NULL DEFAULT 1,
+  pinned     INTEGER NOT NULL DEFAULT 0,
+  note       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_entries_ts  ON entries(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_entries_app ON entries(app, timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS groups (
+  name    TEXT PRIMARY KEY,
+  created INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS entry_groups (
+  stem       TEXT NOT NULL REFERENCES entries(stem) ON DELETE CASCADE,
+  group_name TEXT NOT NULL REFERENCES groups(name)  ON DELETE CASCADE,
+  PRIMARY KEY (stem, group_name)
+);
+CREATE INDEX IF NOT EXISTS idx_entry_groups_group ON entry_groups(group_name);
+
+-- External-content FTS: the index holds no copy of the text, it points at
+-- entries by rowid. The triggers below are what keep the two in step; without
+-- them an external-content table silently serves stale rows after an update.
+--
+-- tokenize='trigram' rather than the default word tokenizer, because this
+-- index exists to back a search box that filters as you type. A word
+-- tokenizer only matches from the start of a word, so "eplo" finds nothing
+-- in "deploy failed"; trigram indexes every three-character run, so any
+-- substring matches, mid-word included. Measured at 20000 rows: substring
+-- search 0.7 ms against 129 ms for scoring every row in Python.
+--
+-- The cost is index size, roughly doubling the database. That is a few MB at
+-- realistic volume and buys the difference between a search that keeps up
+-- with typing and one that does not.
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+  summary, body, app, note,
+  content='entries', content_rowid='rowid', tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+  INSERT INTO entries_fts(rowid, summary, body, app, note)
+  VALUES (new.rowid, new.summary, new.body, new.app, new.note);
+END;
+CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+  INSERT INTO entries_fts(entries_fts, rowid, summary, body, app, note)
+  VALUES ('delete', old.rowid, old.summary, old.body, old.app, old.note);
+END;
+CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
+  INSERT INTO entries_fts(entries_fts, rowid, summary, body, app, note)
+  VALUES ('delete', old.rowid, old.summary, old.body, old.app, old.note);
+  INSERT INTO entries_fts(rowid, summary, body, app, note)
+  VALUES (new.rowid, new.summary, new.body, new.app, new.note);
+END;
+"""
+
+
+def connect():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    # The daemon serializes its own file jobs, but the panel queries the same
+    # database at the same time. WAL lets a read run while a write is in
+    # flight; the timeout covers the brief exclusive moment a commit takes.
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+# ----------------------------------------------------------------- ingest
+
+def cmd_ingest(conn, args):
+    """Record one finalized notification.
+
+    Reads the entry as JSON on stdin (or --json), which is the same object the
+    daemon already holds. Unknown keys are ignored, so the daemon can pass its
+    row through unchanged.
+    """
+    raw = args.json if args.json else sys.stdin.read()
+    try:
+        entry = json.loads(raw or "{}")
+    except ValueError as exc:
+        return {"ok": False, "error": "invalid JSON: %s" % exc}
+    if not isinstance(entry, dict):
+        return {"ok": False, "error": "expected a JSON object"}
+
+    timestamp = int(entry.get("timestamp") or 0)
+    original_id = int(entry.get("originalId") or entry.get("id") or 0)
+    stem = "%d-%d" % (timestamp, original_id)
+    if timestamp <= 0:
+        return {"ok": False, "error": "entry has no usable timestamp"}
+
+    # Only the fields the archive owns are overwritten on conflict. The
+    # triage state (unread, pinned, note) belongs to the user, not the
+    # sender, so a re-ingest of the same notification must not reset it.
+    conn.execute(
+        """
+        INSERT INTO entries
+          (stem, timestamp, app, app_icon, summary, body, urgency, silenced, important)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(stem) DO UPDATE SET
+          app       = excluded.app,
+          app_icon  = excluded.app_icon,
+          summary   = excluded.summary,
+          body      = excluded.body,
+          urgency   = excluded.urgency,
+          silenced  = excluded.silenced,
+          important = excluded.important
+        """,
+        (
+            stem,
+            timestamp,
+            str(entry.get("app") or ""),
+            str(entry.get("appIcon") or ""),
+            str(entry.get("summary") or ""),
+            str(entry.get("body") or ""),
+            int(entry.get("urgency") or 1),
+            1 if entry.get("silenced") else 0,
+            1 if entry.get("important") else 0,
+        ),
+    )
+    pruned = prune(conn)
+    conn.commit()
+    return {"ok": True, "stem": stem, "pruned": pruned}
+
+
+def prune(conn):
+    """Drop anything past retention that the user has not claimed.
+
+    Pinned entries and anything filed into a group are kept indefinitely:
+    both are explicit "this one matters" signals, and a retention window that
+    deleted them would make the feature useless for the one job it has.
+    """
+    cutoff = now_ms() - RETENTION_MS
+    cur = conn.execute(
+        """
+        DELETE FROM entries
+        WHERE timestamp < ?
+          AND pinned = 0
+          AND stem NOT IN (SELECT stem FROM entry_groups)
+        """,
+        (cutoff,),
+    )
+    return cur.rowcount
+
+
+def cmd_prune(conn, args):
+    pruned = prune(conn)
+    conn.commit()
+    return {"ok": True, "pruned": pruned}
+
+
+# ------------------------------------------------------------------ query
+
+def row_to_dict(row, groups_by_stem):
+    return {
+        "stem": row["stem"],
+        "timestamp": row["timestamp"],
+        "app": row["app"],
+        "appIcon": row["app_icon"],
+        "summary": row["summary"],
+        "body": row["body"],
+        "urgency": row["urgency"],
+        "silenced": bool(row["silenced"]),
+        "important": bool(row["important"]),
+        "unread": bool(row["unread"]),
+        "pinned": bool(row["pinned"]),
+        "note": row["note"],
+        "groups": groups_by_stem.get(row["stem"], []),
+    }
+
+
+def fts_query(text):
+    """Turn typed words into a trigram MATCH expression.
+
+    Each token is quoted so punctuation in a summary cannot be read as FTS
+    syntax, and joined with AND so more typing narrows the list. No trailing
+    star: with a trigram index a bare quoted string already matches anywhere
+    inside a word, which is the behaviour a filter-as-you-type box wants.
+
+    Tokens shorter than three characters are dropped rather than searched.
+    Trigram indexes runs of three, so a one or two character token matches
+    nothing at all; ignoring it keeps the first two keystrokes showing the
+    unfiltered list instead of an empty one.
+    """
+    tokens = [t for t in (text or "").split() if len(t) >= 3]
+    if not tokens:
+        return None
+    return " AND ".join('"%s"' % t.replace('"', '""') for t in tokens)
+
+
+def fuzzy_fallback(conn, text, limit, where_sql, where_params):
+    """Rank recent entries by similarity when the index finds nothing.
+
+    The trigram index cannot match a misspelling: "deplyo" shares no
+    three-character run with "deploy". Rather than return nothing, score a
+    bounded window of the newest entries with difflib and keep the close
+    ones.
+
+    The window is what keeps this cheap. Scoring every row costs ~129 ms at
+    20000 rows, which is visible while typing; scoring the newest 2000 costs
+    ~15 ms, and an entry old enough to fall outside that window is one the
+    user is better off finding by app or date filter anyway.
+    """
+    import difflib
+
+    sql = "SELECT e.* FROM entries e"
+    if where_sql:
+        sql += " WHERE " + " AND ".join(where_sql)
+    sql += " ORDER BY e.timestamp DESC LIMIT 2000"
+    rows = conn.execute(sql, where_params).fetchall()
+
+    needle = (text or "").lower()
+    threshold = 0.62
+    scored = []
+
+    # One matcher reused across every comparison, with the query as seq2 so
+    # difflib keeps its index of that string instead of rebuilding it per row.
+    matcher = difflib.SequenceMatcher()
+    matcher.set_seq2(needle)
+
+    for row in rows:
+        haystack = ("%s %s" % (row["summary"], row["body"])).lower()
+        best = 0.0
+        # Word by word, deduped: a query is compared against the words of an
+        # entry, and repeating a word cannot improve the score.
+        for word in set(haystack.split()):
+            # A length gap this wide cannot score above the threshold, and
+            # checking it costs nothing next to a real comparison.
+            if abs(len(word) - len(needle)) > 3:
+                continue
+            matcher.set_seq1(word)
+            # Both are upper bounds on ratio() and far cheaper: they reject
+            # most candidates without the full edit-distance walk. Measured at
+            # 20000 rows, this is the difference between 98 ms and 18 ms.
+            if matcher.real_quick_ratio() < threshold:
+                continue
+            if matcher.quick_ratio() < threshold:
+                continue
+            score = matcher.ratio()
+            if score > best:
+                best = score
+        if best >= threshold:
+            scored.append((best, row))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [row for _, row in scored[:limit]]
+
+
+def cmd_list(conn, args):
+    where = []
+    params = []
+    # The non-text filters, kept apart so a fuzzy fallback can reuse them:
+    # a misspelled search inside "app = Slack" must stay inside that app.
+    filter_sql = []
+    filter_params = []
+
+    if args.app:
+        filter_sql.append("e.app = ?")
+        filter_params.append(args.app)
+    if args.group:
+        filter_sql.append(
+            "e.stem IN (SELECT stem FROM entry_groups WHERE group_name = ?)")
+        filter_params.append(args.group)
+    if args.pinned:
+        filter_sql.append("e.pinned = 1")
+    if args.unread:
+        filter_sql.append("e.unread = 1")
+    if args.silenced:
+        filter_sql.append("e.silenced = 1")
+    if args.since:
+        filter_sql.append("e.timestamp >= ?")
+        filter_params.append(int(args.since))
+
+    where.extend(filter_sql)
+    params.extend(filter_params)
+
+    match = fts_query(args.query) if args.query else None
+    if match:
+        where.insert(0,
+            "e.rowid IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?)")
+        params.insert(0, match)
+
+    sql = "SELECT e.* FROM entries e"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    # Pinned first so a claimed entry stays reachable without searching for
+    # it, then newest first within each band.
+    sql += " ORDER BY e.pinned DESC, e.timestamp DESC LIMIT ? OFFSET ?"
+    params.extend([int(args.limit), int(args.offset)])
+
+    rows = conn.execute(sql, params).fetchall()
+
+    # A typed query that matched nothing is usually a typo rather than a real
+    # absence, so fall back to similarity scoring before reporting no results.
+    fuzzy = False
+    if args.query and not rows:
+        rows = fuzzy_fallback(
+            conn, args.query, int(args.limit), filter_sql, filter_params)
+        fuzzy = bool(rows)
+
+    groups_by_stem = {}
+    if rows:
+        marks = ",".join("?" * len(rows))
+        for g in conn.execute(
+                "SELECT stem, group_name FROM entry_groups WHERE stem IN (%s)" % marks,
+                [r["stem"] for r in rows]):
+            groups_by_stem.setdefault(g["stem"], []).append(g["group_name"])
+
+    total = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    unread = conn.execute("SELECT COUNT(*) FROM entries WHERE unread = 1").fetchone()[0]
+    return {
+        "ok": True,
+        "entries": [row_to_dict(r, groups_by_stem) for r in rows],
+        "total": total,
+        "unread": unread,
+        "retentionDays": RETENTION_DAYS,
+        # True when these came from similarity scoring rather than the index,
+        # so the panel can say "nothing matched, showing closest" instead of
+        # silently presenting approximate hits as exact ones.
+        "fuzzy": fuzzy,
+    }
+
+
+def cmd_apps(conn, args):
+    rows = conn.execute(
+        """
+        SELECT app, COUNT(*) AS n, MAX(timestamp) AS last, MAX(app_icon) AS icon
+        FROM entries GROUP BY app ORDER BY n DESC, app ASC
+        """).fetchall()
+    return {"ok": True, "apps": [
+        {"app": r["app"], "count": r["n"], "last": r["last"], "appIcon": r["icon"]}
+        for r in rows]}
+
+
+def cmd_groups(conn, args):
+    rows = conn.execute(
+        """
+        SELECT g.name, g.created, COUNT(eg.stem) AS n
+        FROM groups g LEFT JOIN entry_groups eg ON eg.group_name = g.name
+        GROUP BY g.name ORDER BY g.name ASC
+        """).fetchall()
+    return {"ok": True, "groups": [
+        {"name": r["name"], "count": r["n"], "created": r["created"]} for r in rows]}
+
+
+# --------------------------------------------------------------- mutations
+
+def cmd_set(conn, args):
+    """Set triage state on one or more entries."""
+    stems = args.stem
+    if not stems:
+        return {"ok": False, "error": "no stem given"}
+
+    sets, params = [], []
+    if args.pinned is not None:
+        sets.append("pinned = ?")
+        params.append(1 if args.pinned == "true" else 0)
+    if args.unread is not None:
+        sets.append("unread = ?")
+        params.append(1 if args.unread == "true" else 0)
+    if args.note is not None:
+        sets.append("note = ?")
+        params.append(args.note)
+    if not sets:
+        return {"ok": False, "error": "nothing to set"}
+
+    marks = ",".join("?" * len(stems))
+    cur = conn.execute(
+        "UPDATE entries SET %s WHERE stem IN (%s)" % (", ".join(sets), marks),
+        params + stems)
+    conn.commit()
+    return {"ok": True, "changed": cur.rowcount}
+
+
+def cmd_delete(conn, args):
+    if not args.stem:
+        return {"ok": False, "error": "no stem given"}
+    marks = ",".join("?" * len(args.stem))
+    cur = conn.execute("DELETE FROM entries WHERE stem IN (%s)" % marks, args.stem)
+    conn.commit()
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+def cmd_clear(conn, args):
+    """Bulk delete. Pinned and grouped entries are kept unless --force."""
+    where, params = [], []
+    if args.app:
+        where.append("app = ?")
+        params.append(args.app)
+    if args.before:
+        where.append("timestamp < ?")
+        params.append(int(args.before))
+    if not args.force:
+        where.append("pinned = 0")
+        where.append("stem NOT IN (SELECT stem FROM entry_groups)")
+    sql = "DELETE FROM entries"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    cur = conn.execute(sql, params)
+    conn.commit()
+    return {"ok": True, "deleted": cur.rowcount}
+
+
+def cmd_group(conn, args):
+    """Add or remove entries from a group, creating the group on demand."""
+    name = (args.name or "").strip()
+    if not name:
+        return {"ok": False, "error": "group name is empty"}
+
+    if args.action == "delete":
+        conn.execute("DELETE FROM groups WHERE name = ?", (name,))
+        conn.commit()
+        return {"ok": True, "group": name, "removed": True}
+
+    conn.execute("INSERT OR IGNORE INTO groups(name, created) VALUES (?, ?)",
+                 (name, now_ms()))
+    if args.action == "add" and args.stem:
+        conn.executemany(
+            "INSERT OR IGNORE INTO entry_groups(stem, group_name) VALUES (?, ?)",
+            [(s, name) for s in args.stem])
+    elif args.action == "remove" and args.stem:
+        marks = ",".join("?" * len(args.stem))
+        conn.execute(
+            "DELETE FROM entry_groups WHERE group_name = ? AND stem IN (%s)" % marks,
+            [name] + args.stem)
+    conn.commit()
+    return {"ok": True, "group": name}
+
+
+def cmd_serve(conn, args):
+    """Answer commands on stdin, one JSON line out per line in.
+
+    Starting the interpreter and opening the database costs about 36 ms,
+    which dwarfs the 1-3 ms a query itself takes. Paying that once and
+    keeping the process alive is what lets the panel filter on every
+    keystroke; the alternative, a process per keystroke, is the whole reason
+    search would feel slow.
+
+    Protocol is deliberately dumb so it can be driven by hand from a
+    terminal: one JSON object per line, {"cmd": "list", "query": "..."},
+    and one JSON object back per line.
+    """
+    parser = build_parser()
+    sys.stdout.write(json.dumps({"ok": True, "ready": True}) + "\n")
+    sys.stdout.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+            argv = [str(request.get("cmd") or "")]
+            for key, value in request.items():
+                if key in ("cmd", "stem"):
+                    continue
+                if value is True:
+                    argv.append("--%s" % key)
+                elif value not in (None, False):
+                    argv.extend(["--%s" % key, str(value)])
+            for stem in request.get("stem") or []:
+                argv.append(str(stem))
+            # parse_args exits the process on bad input, which would kill the
+            # server; parse_known_args plus an explicit check keeps it alive.
+            # argparse writes its usage to stderr and raises SystemExit on a
+            # bad command. That is right for a one-shot run and wrong here,
+            # where the message is noise and the exit would end the session.
+            stderr, sys.stderr = sys.stderr, open(os.devnull, "w")
+            try:
+                sub_args = parser.parse_args(argv)
+            finally:
+                sys.stderr.close()
+                sys.stderr = stderr
+            result = sub_args.fn(conn, sub_args)
+        except SystemExit:
+            result = {"ok": False, "error": "unknown command or bad arguments"}
+        except Exception as exc:  # keep serving whatever one request did
+            result = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        sys.stdout.write(json.dumps(result) + "\n")
+        sys.stdout.flush()
+    return None
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("ingest"); p.add_argument("--json"); p.set_defaults(fn=cmd_ingest)
+    sub.add_parser("prune").set_defaults(fn=cmd_prune)
+
+    p = sub.add_parser("list")
+    p.add_argument("--query"); p.add_argument("--app"); p.add_argument("--group")
+    p.add_argument("--since")
+    p.add_argument("--pinned", action="store_true")
+    p.add_argument("--unread", action="store_true")
+    p.add_argument("--silenced", action="store_true")
+    p.add_argument("--limit", default=200); p.add_argument("--offset", default=0)
+    p.set_defaults(fn=cmd_list)
+
+    sub.add_parser("apps").set_defaults(fn=cmd_apps)
+    sub.add_parser("groups").set_defaults(fn=cmd_groups)
+
+    p = sub.add_parser("set")
+    p.add_argument("stem", nargs="*")
+    p.add_argument("--pinned", choices=["true", "false"])
+    p.add_argument("--unread", choices=["true", "false"])
+    p.add_argument("--note")
+    p.set_defaults(fn=cmd_set)
+
+    p = sub.add_parser("delete"); p.add_argument("stem", nargs="*")
+    p.set_defaults(fn=cmd_delete)
+
+    p = sub.add_parser("clear")
+    p.add_argument("--app"); p.add_argument("--before")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_clear)
+
+    p = sub.add_parser("group")
+    p.add_argument("action", choices=["add", "remove", "delete"])
+    p.add_argument("name")
+    p.add_argument("stem", nargs="*")
+    p.set_defaults(fn=cmd_group)
+
+    sub.add_parser("serve").set_defaults(fn=cmd_serve)
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        conn = connect()
+        result = args.fn(conn, args)
+    except sqlite3.Error as exc:
+        result = {"ok": False, "error": "database error: %s" % exc}
+    # serve streams its own responses and returns nothing at the end.
+    if result is None:
+        return 0
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "zeroge.notification-archive",
+  "name": "Notification Archive",
+  "version": "1.0.0",
+  "author": "zeroge",
+  "license": "MIT",
+  "description": "Searchable 30-day archive of received notifications, with pinning, groups and notes",
+  "kinds": [
+    "panel"
+  ],
+  "entryPoints": {
+    "panel": "Panel.qml"
+  }
+}
