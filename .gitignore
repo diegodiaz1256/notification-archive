@@ -1,2 +1,11 @@
 __pycache__/
 *.pyc
+
+# The archive database lives in ~/.local/state/omarchy/notifications/, outside
+# this directory, so it cannot be committed from here. Listed anyway so a
+# future change that writes one alongside the plugin cannot publish a copy of
+# every notification this machine has received.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
