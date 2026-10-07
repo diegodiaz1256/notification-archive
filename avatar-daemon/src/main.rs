@@ -1,14 +1,13 @@
 //! Captures notification avatars that would otherwise be lost.
 //!
-//! A sender can deliver its image as raw pixels in the freedesktop
-//! `image-data` hint rather than as a file path. Brave does this for WhatsApp
-//! web notifications, so the contact photo shows on the toast and nowhere
-//! afterwards: Quickshell turns those pixels into an in-process `image://`
-//! URL that dies with the notification, and it strips the hint from the map
-//! it exposes to QML, so the shell cannot reach the pixels to save them.
+//! A sender can deliver its image as a file (`image-path`) or as raw pixels
+//! (`image-data`). Brave sends WhatsApp web contact photos as `image-path`
+//! into a scoped /tmp directory it deletes after the notification closes, so
+//! the photo shows on the toast and nowhere afterwards. Quickshell also strips
+//! both hints from the map it exposes to QML, so the shell cannot save them.
 //!
-//! This daemon watches the session bus as a passive monitor and writes those
-//! pixels to a PNG. `BecomeMonitor` is read-only: it never owns the
+//! This daemon watches the session bus as a passive monitor, copies the
+//! `image-path` file promptly and writes `image-data` pixels to a PNG. `BecomeMonitor` is read-only: it never owns the
 //! notification bus name, so the shell's own daemon keeps receiving and
 //! displaying every notification exactly as before. If this process is not
 //! running, nothing changes except that avatars are not saved.
@@ -18,10 +17,10 @@
 //! and deletes anything without a matching notification JSON, which every file
 //! written here would be.
 //!
-//! They are named `<app>-<summary hash>.png`. The shell names its own copies
-//! after a notification id this process never sees (the monitor observes the
-//! method call, the id is assigned in the reply), so this matches on what both
-//! sides do have: the sending app and its summary. Two messages from the same
+//! They are named `avatar-<FNV-1a 64 of the summary>.png`. The shell names its
+//! own copies after a notification id this process never sees (the monitor
+//! observes the method call, the id is assigned in the reply), and it rewrites
+//! the app name, so the key is the summary alone. Two messages from the same
 //! contact collide on that name, which is correct -- it is the same photo, and
 //! the newer write keeps it current.
 

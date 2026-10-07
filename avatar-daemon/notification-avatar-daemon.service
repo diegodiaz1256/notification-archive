@@ -1,5 +1,5 @@
 [Unit]
-Description=Capture notification avatars delivered as image-data
+Description=Capture notification avatars (image-path files and image-data pixels)
 Documentation=https://github.com/diegodiaz1256/notification-archive
 # The session bus is the only thing it needs; the shell can start later or
 # restart freely, since this never talks to it.

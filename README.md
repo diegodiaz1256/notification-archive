@@ -48,15 +48,18 @@ dropped thirty days after it arrived.
 
 ## Avatars
 
-Some senders deliver their image as raw pixels in the freedesktop
-`image-data` hint rather than as a file path. Brave does this for WhatsApp
-web notifications, which is why the contact photo appears on the toast and
-nowhere afterwards: Quickshell turns those pixels into an in-process URL that
-dies with the notification, and strips the hint from what it exposes to QML,
-so the shell cannot reach the pixels to save them.
+Some senders attach a sender image, such as a contact photo, that the shell
+shows on the toast and then loses. Brave does this for WhatsApp web
+notifications. It sends the photo through the `image-path` hint, pointing at a
+file in its own scoped `/tmp` directory, and deletes that directory seconds
+after the notification closes. Other senders deliver raw pixels in the
+`image-data` hint instead, which Quickshell turns into an in-process URL that
+dies with the notification. Quickshell also strips both hints from what it
+exposes to QML, so the shell cannot save the image itself.
 
 `avatar-daemon/` is a small Rust daemon that watches the session bus as a
-passive monitor and writes those pixels to a PNG. It uses `BecomeMonitor`,
+passive monitor and copies the `image-path` file promptly, before the sender deletes it, and
+encodes `image-data` pixels to a PNG. It uses `BecomeMonitor`,
 which is read-only: it never owns the notification bus name, so the shell's
 own daemon keeps receiving and displaying everything exactly as before. If it
 is not running, nothing changes except that avatars are not saved.
@@ -72,10 +75,14 @@ the `images/` directory beside it: the shell sweeps that one at startup and
 deletes anything without a matching notification JSON, which every avatar
 would be.
 
-They are named after the sending app and a hash of the summary, because the
-monitor observes the `Notify` call while the notification id is only assigned
-in the reply. Two messages from the same contact therefore share a file, which
-is what you want: it is the same photo, kept current by the newer write.
+Each file is named `avatar-<hash>.png`, where the hash is FNV-1a 64 of the
+notification summary alone. The app name is left out because the shell
+rewrites it (Brave shows up as "WhatsApp"), and the monitor observes the
+`Notify` call while the notification id is only assigned in the reply. Two
+messages with the same summary therefore share a file, which is what you want
+for one contact: it is the same photo, kept current by the newer write. The
+trade-off is that two senders with the same summary text share one avatar,
+and the last write wins. The panels compute the same hash in QML.
 
 An avatar is deleted thirty days after that sender was last seen, matching how
 long the archive keeps entries, with a 500-file ceiling as a backstop.
