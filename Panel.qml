@@ -14,6 +14,7 @@
 // that keeps up with typing and one that does not.
 
 import QtQuick
+import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -1005,6 +1006,23 @@ Item {
                         : ""
                       fillMode: Image.PreserveAspectCrop
                       asynchronous: true
+                      // QML's clip is a rectangle, so a radius on the container does not
+                      // round the photo. Mask the image itself.
+                      layer.enabled: status === Image.Ready
+                      layer.effect: MultiEffect {
+                        maskEnabled: true
+                        maskSource: entryAvatarMask
+                        maskThresholdMin: 0.5
+                        maskSpreadAtMin: 1.0
+                      }
+                    }
+
+                    Rectangle {
+                      id: entryAvatarMask
+                      anchors.fill: entryAvatar
+                      radius: width / 2
+                      layer.enabled: true
+                      visible: false
                     }
 
                     Image {
