@@ -467,3 +467,22 @@ fn trim(dir: &PathBuf) {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::fnv1a;
+
+    // Shared with tests/avatar-hash.test.js and the Panel.qml copies.
+    #[test]
+    fn fnv1a_vectors() {
+        for (text, want) in [
+            ("", 0xcbf2_9ce4_8422_2325u64),
+            ("Alba Galleguiña", 0xc50e_c1f6_f364_2070),
+            ("Contact", 0x87ba_e271_0b24_92c3),
+            ("Someone Else", 0x1aad_d9b3_8e37_b924),
+            ("Ana 😀", 0xdfad_939d_8538_0b8e),
+        ] {
+            assert_eq!(fnv1a(text), want, "{text}");
+        }
+    }
+}
